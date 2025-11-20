@@ -1,3 +1,4 @@
 requests>=2.31.0
+TibCleaner @git+https://github.com/OpenPecha/TibCleaner.git
 
 

@@ -10,7 +10,6 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, unquote, urlparse
 from urllib.request import Request, urlopen
-
 try:
     import requests  # type: ignore
 except Exception:
@@ -60,22 +59,65 @@ def stream_download(url: str, dest_path: str, timeout: int = 60, chunk_size: int
     if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
         return
     ensure_dir(os.path.dirname(dest_path))
+    # Build robust headers, including a sane Referer for hosts that require it
+    parsed = urlparse(url)
+    headers = dict(DEFAULT_HEADERS)
+    if parsed.scheme and parsed.netloc:
+        headers.setdefault("Referer", f"{parsed.scheme}://{parsed.netloc}/")
+    headers.setdefault("Accept", "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8")
+
     if requests is not None:
-        with requests.get(url, stream=True, headers=DEFAULT_HEADERS, timeout=timeout) as r:
+        with requests.get(
+            url,
+            stream=True,
+            headers=headers,
+            timeout=timeout,
+            allow_redirects=True,
+        ) as r:
             r.raise_for_status()
+            content_type = (r.headers.get("Content-Type") or "").lower()
+            first_chunk: Optional[bytes] = None
             with open(dest_path, "wb") as f:
-                for chunk in r.itercontent(chunk_size=chunk_size):
-                    if chunk:
-                        f.write(chunk)
+                for chunk in r.iter_content(chunk_size=chunk_size):
+                    if not chunk:
+                        continue
+                    if first_chunk is None:
+                        first_chunk = chunk
+                    f.write(chunk)
+            # Validate PDF downloads when applicable
+            _, ext = os.path.splitext(dest_path)
+            if (ext.lower() == ".pdf" or "pdf" in content_type):
+                if not first_chunk or (not first_chunk.startswith(b"%PDF-") and "pdf" not in content_type):
+                    try:
+                        os.remove(dest_path)
+                    except Exception:
+                        pass
+                    raise RuntimeError(
+                        f"Downloaded content is not a PDF (Content-Type: {content_type or 'unknown'})"
+                    )
         return
     # urllib fallback
-    req = Request(url, headers=DEFAULT_HEADERS, method="GET")
-    with urlopen(req, timeout=timeout) as r, open(dest_path, "wb") as f:
-        while True:
-            chunk = r.read(chunk_size)
-            if not chunk:
-                break
-            f.write(chunk)
+    req = Request(url, headers=headers, method="GET")
+    with urlopen(req, timeout=timeout) as r:
+        content_type = (r.headers.get("Content-Type") or "").lower()
+        first_chunk: Optional[bytes] = None
+        with open(dest_path, "wb") as f:
+            while True:
+                chunk = r.read(chunk_size)
+                if not chunk:
+                    break
+                if first_chunk is None and chunk:
+                    first_chunk = chunk
+                f.write(chunk)
+    # Validate PDF downloads when applicable (urllib path)
+    _, ext = os.path.splitext(dest_path)
+    if ext.lower() == ".pdf":
+        if not first_chunk or not first_chunk.startswith(b"%PDF-"):
+            try:
+                os.remove(dest_path)
+            except Exception:
+                pass
+            raise RuntimeError("Downloaded content is not a PDF")
 
 
 def load_category_mapping(mapping_path: str) -> Dict[int, str]:
@@ -166,6 +208,33 @@ def save_metadata(prayer_dir: str, prayer: Dict[str, Any]) -> None:
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(prayer, f, ensure_ascii=False, indent=2)
 
+def pdf_to_txt(file_path: Path, output_dir: Path, extracted_text: str):
+    """Converts pdf file to a txt file"""
+    output_file = output_dir / f"{file_path.stem}.txt"
+    text = ""
+    file_type = file_path.suffix[1:]
+
+    if file_type == "pdf":
+        text = extracted_text
+        if text:
+            with open(output_file, "w", encoding="utf-8") as file:
+                file.write(text)
+            return output_file
+
+
+def read_pdf_file(pdf_file_path: Path) -> str:
+    """Reads the content of a PDF file using pypdf."""
+    text = ""
+    try:
+        with open(pdf_file_path, "rb") as pdf_file:
+            pdf_reader = PdfReader(pdf_file)
+            for page in pdf_reader.pages:
+                text += page.extract_text() if page.extract_text() else ""
+        return text
+    except Exception as e:
+        print(f"pdf file {pdf_file_path} is corrupted")
+        return ""
+
 
 def download_assets_for_prayer(prayer_dir: str, prayer: Dict[str, Any]) -> None:
     # Audio tracks
@@ -209,6 +278,9 @@ def download_assets_for_prayer(prayer_dir: str, prayer: Dict[str, Any]) -> None:
             dest = os.path.join(docs_dir, fname)
             try:
                 stream_download(url, dest)
+                extracted_text = read_pdf_file(dest)
+                if extracted_text:
+                    pdf_to_txt(dest, docs_dir, extracted_text)
             except Exception as e:
                 print(f"[warn] Failed to download document: {url} -> {dest}: {e}")
 
